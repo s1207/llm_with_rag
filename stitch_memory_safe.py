@@ -2,138 +2,164 @@ import cv2
 import numpy as np
 import os
 
-DOWNSCALE = 0.25   # use low-res copy for homography only
+# ------------------------------------------------
+#  SETTINGS
+# ------------------------------------------------
 
-# ============================================================
-# 1. Detect horizontal reference bar (low memory)
-# ============================================================
-def detect_horizontal_bar(gray):
-    grad = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=5)
-    grad = cv2.convertScaleAbs(grad)
+INPUT_DIR = "/mnt/data/zones"       # Folder containing zone images
+OUTPUT_FULL = "/mnt/data/final_full.png"
+OUTPUT_SMALL = "/mnt/data/final_small.png"
 
-    thr = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV, 31, 8
-    )
+# Downsample factor for preview
+PREVIEW_SCALE = 0.25
 
-    comb = cv2.bitwise_or(thr, grad)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25,7))
-    closed = cv2.morphologyEx(comb, cv2.MORPH_CLOSE, kernel, 2)
-
-    cnts,_ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    best = None
-    best_score = -1
-    for c in cnts:
-        x,y,w,h = cv2.boundingRect(c)
-        aspect = w / max(h,1)
-        area = cv2.contourArea(c)
-        score = area * aspect
-        if score > best_score:
-            best_score = score
-            best = c
-
-    if best is None:
-        raise RuntimeError("Horizontal bar not detected")
-
-    M = cv2.moments(best)
-    cy = int(M["m01"] / (M["m00"]+1e-6))
-    return cy
+# Feature detection resolution (scales down input for keypoints only)
+FEATURE_SCALE = 0.5
 
 
-# ============================================================
-# 2. Compute approximate transform (downsampled)
-# ============================================================
-def compute_transform(base_full, mov_full):
-    base = cv2.resize(base_full, None, fx=DOWNSCALE, fy=DOWNSCALE)
-    mov  = cv2.resize(mov_full,  None, fx=DOWNSCALE, fy=DOWNSCALE)
+# ------------------------------------------------
+#  HELPER FUNCTIONS
+# ------------------------------------------------
 
-    g1 = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
-    g2 = cv2.cvtColor(mov,  cv2.COLOR_BGR2GRAY)
+def load_for_features(path):
+    """Loads image at reduced resolution ONLY for feature detection."""
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise Exception("Failed to load: " + path)
+    if FEATURE_SCALE != 1.0:
+        img = cv2.resize(img, None, fx=FEATURE_SCALE, fy=FEATURE_SCALE)
+    return img
 
-    cy1 = detect_horizontal_bar(g1)
-    cy2 = detect_horizontal_bar(g2)
 
-    dy_low = cy1 - cy2
-    dy_full = dy_low / DOWNSCALE   # rescale to full resolution
+def load_full(path):
+    """Loads full-resolution image for final warping."""
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise Exception("Failed to load full-res: " + path)
+    return img
 
-    # Simple vertical translation
-    H = np.array([
-        [1, 0, 0],
-        [0, 1, dy_full],
-        [0, 0, 1]
-    ], dtype=np.float32)
 
+def detect_and_match(imgA, imgB):
+    """Detect and match SIFT (or ORB) features."""
+    sift = cv2.SIFT_create()
+
+    kA, dA = sift.detectAndCompute(imgA, None)
+    kB, dB = sift.detectAndCompute(imgB, None)
+
+    matcher = cv2.BFMatcher()
+    matches = matcher.knnMatch(dA, dB, k=2)
+
+    good = []
+    for m, n in matches:
+        if m.distance < 0.7 * n.distance:
+            good.append(m)
+
+    ptsA = np.float32([kA[m.queryIdx].pt for m in good])
+    ptsB = np.float32([kB[m.trainIdx].pt for m in good])
+
+    return ptsA, ptsB
+
+
+def compute_homography(ptsA, ptsB):
+    H, _ = cv2.findHomography(ptsA, ptsB, cv2.RANSAC, 5.0)
     return H
 
 
-# ============================================================
-# 3. Memory-mapped canvas stitching (no huge RAM use)
-# ============================================================
-def stitch_large(images):
-    # Start canvas size with first image
-    h0, w0 = images[0].shape[:2]
+# ------------------------------------------------
+#  MAIN STITCHING LOGIC
+# ------------------------------------------------
 
-    # Make a memmapped giant canvas on disk
-    canvas_w = sum(img.shape[1] for img in images)
-    canvas_h = max(img.shape[0] for img in images)
+def stitch_zones():
+    # List all images in order
+    files = sorted([f for f in os.listdir(INPUT_DIR) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+    paths = [os.path.join(INPUT_DIR, f) for f in files]
 
-    mmap_path = "/mnt/data/stitch_memmap.npy"
-    canvas = np.memmap(mmap_path, dtype=np.uint8, mode='w+',
-                       shape=(canvas_h, canvas_w, 3))
+    print("Found", len(paths), "zone images.")
 
-    # Clear
-    canvas[:] = 0
+    # Load first image (full-res) and use it as the base
+    base_full = load_full(paths[0])
 
-    # Place first image
-    offset_x = 0
-    canvas[0:h0, offset_x:offset_x+w0] = images[0]
-    offset_x += w0
+    # Estimate a very large canvas: 3× width × 3× height
+    H0, W0 = base_full.shape[:2]
+    CANVAS_H = H0 * 3
+    CANVAS_W = W0 * 3
 
-    # Stitch remaining images one by one
-    for i in range(1, len(images)):
-        print(f"Stitching image {i+1}/{len(images)} ...")
-        base = images[i-1]
-        mov  = images[i]
+    print("Allocating canvas:", CANVAS_W, "×", CANVAS_H)
+    canvas = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
 
-        H = compute_transform(base, mov)
+    # Place the first image in the center
+    offset_x = W0
+    offset_y = H0
+    canvas[offset_y:offset_y + H0, offset_x:offset_x + W0] = base_full
 
-        # Warp mov into local tile to avoid large arrays
-        h,w = canvas.shape[:2]
+    # Accumulated global homography
+    H_global = np.eye(3)
 
-        # Only warp a small width tile for mov
-        tile_w = mov.shape[1] + 200
-        tile_h = canvas_h
+    prev_features = load_for_features(paths[0])
 
-        warped = cv2.warpPerspective(mov, H, (tile_w, tile_h))
+    for i in range(1, len(paths)):
+        print(f"\nProcessing tile {i+1}/{len(paths)}…")
 
-        # Paste at offset
-        canvas[0:tile_h, offset_x:offset_x+tile_w] = np.where(
-            warped>0, warped, canvas[0:tile_h, offset_x:offset_x+tile_w]
+        # Load low-res version for matching
+        next_features = load_for_features(paths[i])
+
+        # Detect and match
+        ptsA, ptsB = detect_and_match(prev_features, next_features)
+
+        # Compute relative homography (low-res)
+        H_rel = compute_homography(ptsB, ptsA)
+
+        # Scale homography back to full resolution coordinates
+        s = 1.0 / FEATURE_SCALE
+        S = np.diag([s, s, 1.0])
+        H_rel_full = S @ H_rel @ np.linalg.inv(S)
+
+        # Update global homography
+        H_global = H_global @ H_rel_full
+
+        # Load full resolution image
+        full = load_full(paths[i])
+
+        # Warp directly into the big canvas
+        cv2.warpPerspective(
+            full,
+            H_global,
+            (CANVAS_W, CANVAS_H),
+            dst=canvas,
+            borderMode=cv2.BORDER_TRANSPARENT
         )
 
-        offset_x += mov.shape[1]
+        prev_features = next_features
 
-    canvas.flush()
-    return mmap_path, canvas_w
+    return canvas
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# ------------------------------------------------
+#  SAVE OUTPUTS
+# ------------------------------------------------
+
 def main():
-    # Fill with actual file paths + camera orientations applied beforehand
-    IMAGE_PATHS = [
-        # "/mnt/data/1.1_back.jpg",
-        # ...
-    ]
+    final_canvas = stitch_zones()
 
-    images = [cv2.imread(p) for p in IMAGE_PATHS]
-    mmap_path, final_width = stitch_large(images)
+    # Crop empty borders
+    gray = cv2.cvtColor(final_canvas, cv2.COLOR_BGR2GRAY)
+    mask = gray > 0
+    coords = np.argwhere(mask)
 
-    print("Memory-mapped output saved at:", mmap_path)
-    print("To export as PNG, load in chunks or crop.")
+    y0, x0 = coords.min(axis=0)
+    y1, x1 = coords.max(axis=0)
+
+    final_crop = final_canvas[y0:y1+1, x0:x1+1]
+
+    print("Saving FULL resolution:", OUTPUT_FULL)
+    cv2.imwrite(OUTPUT_FULL, final_crop)
+
+    # Make preview
+    small = cv2.resize(final_crop, None, fx=PREVIEW_SCALE, fy=PREVIEW_SCALE)
+    print("Saving PREVIEW:", OUTPUT_SMALL)
+    cv2.imwrite(OUTPUT_SMALL, small)
+
+    print("Done.")
 
 
 if __name__ == "__main__":
