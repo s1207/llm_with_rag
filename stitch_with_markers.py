@@ -1,64 +1,72 @@
 """
-Marker-based stitching for 6 tiled images using '+' fiducial markers.
+Hybrid stitching:
+- Vertical alignment (X): '+' markers
+- Horizontal alignment (Y): dark horizontal lines
 
-Layout (reference):
+Layout:
     [ 1 | 2 ]
     [ 3 | 4 ]
     [ 5 | 6 ]
-
-Assumptions:
-- Each tile contains exactly 2 '+' markers
-- Markers overlap with neighboring tiles
-- Only rotation + translation (no scale change)
-- Images are grayscale or convertible to grayscale
-
-Dependencies:
-    pip install opencv-python numpy
 """
 
 import cv2
 import numpy as np
-import os
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Rotation utilities
-# ------------------------------------------------------------
+# ============================================================
 
-def rotate_image(image, angle_deg):
-    """Rotate image by arbitrary angle around its center"""
-    h, w = image.shape[:2]
-    center = (w // 2, h // 2)
-
-    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-    return cv2.warpAffine(
-        image, M, (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0
-    )
+def rotate_image(img, angle):
+    h, w = img.shape
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), borderValue=0)
 
 
-def rotate_90(image, k):
+def rotate_90(img, k):
+    return np.rot90(img, k).copy()
+
+
+# ============================================================
+# Horizontal dark line detection
+# ============================================================
+
+def detect_horizontal_dark_lines(gray):
     """
-    Rotate image by multiples of 90 degrees.
-    k = 0,1,2,3 -> 0°, 90°, 180°, 270°
+    Detect strong horizontal dark lines.
+    Returns list of Y positions.
     """
-    return np.rot90(image, k).copy()
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # emphasize horizontal structures
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 35))
+    dark = cv2.morphologyEx(blur, cv2.MORPH_OPEN, kernel)
+
+    # project vertically
+    proj = np.mean(dark, axis=1)
+
+    # normalize & invert
+    proj = (proj.max() - proj)
+    proj /= proj.max() + 1e-6
+
+    # threshold
+    line_idx = np.where(proj > 0.5)[0]
+
+    if len(line_idx) == 0:
+        return []
+
+    # group contiguous indices
+    groups = np.split(line_idx, np.where(np.diff(line_idx) > 2)[0] + 1)
+    centers = [int(g.mean()) for g in groups if len(g) > 5]
+
+    return centers
 
 
-# ------------------------------------------------------------
-# Marker detection
-# ------------------------------------------------------------
+# ============================================================
+# Plus marker detection
+# ============================================================
 
 def detect_plus_markers(gray):
-    """
-    Detect '+' fiducial markers.
-    Returns list of (x, y) centers.
-    """
-    if len(gray.shape) == 3:
-        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-
     bw = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_MEAN_C,
@@ -69,134 +77,112 @@ def detect_plus_markers(gray):
     kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (15, 15))
     bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
 
-    contours, _ = cv2.findContours(
-        bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     centers = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
+    for c in contours:
+        area = cv2.contourArea(c)
         if area < 500:
             continue
 
-        x, y, w, h = cv2.boundingRect(cnt)
-        aspect = w / float(h)
-
-        if 0.7 < aspect < 1.3:
-            cx = x + w / 2
-            cy = y + h / 2
-            centers.append((cx, cy))
+        x, y, w, h = cv2.boundingRect(c)
+        if 0.7 < w / float(h) < 1.3:
+            centers.append((x + w / 2, y + h / 2))
 
     return centers
 
 
-# ------------------------------------------------------------
-# Transform estimation
-# ------------------------------------------------------------
+# ============================================================
+# Tile loader
+# ============================================================
 
-def estimate_rigid_transform(src_pts, dst_pts):
-    """
-    Estimate rotation + translation between two sets of marker points.
-    """
-    src_pts = np.asarray(src_pts, dtype=np.float32)
-    dst_pts = np.asarray(dst_pts, dtype=np.float32)
-
-    if len(src_pts) < 2:
-        raise RuntimeError("At least 2 markers required")
-
-    M, _ = cv2.estimateAffinePartial2D(
-        src_pts,
-        dst_pts,
-        method=cv2.RANSAC,
-        ransacReprojThreshold=2.0
-    )
-
-    return M
-
-
-# ------------------------------------------------------------
-# Tile loading
-# ------------------------------------------------------------
-
-def load_tile(path, rotate_deg=None, rotate_90_k=None):
+def load_tile(path, rot=None):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        raise IOError(f"Failed to load image: {path}")
+        raise IOError(path)
 
-    if rotate_90_k is not None:
-        img = rotate_90(img, rotate_90_k)
-
-    if rotate_deg is not None:
-        img = rotate_image(img, rotate_deg)
+    if rot:
+        if "k" in rot:
+            img = rotate_90(img, rot["k"])
+        if "deg" in rot:
+            img = rotate_image(img, rot["deg"])
 
     return img
 
 
-# ------------------------------------------------------------
-# Stitching pipeline
-# ------------------------------------------------------------
+# ============================================================
+# Stitching logic
+# ============================================================
 
 def stitch_tiles(tile_paths, rotations=None):
-    """
-    tile_paths: dict {zone_id: filepath}
-    rotations: dict {zone_id: {"deg": float OR "k": int}}
-    """
-
     tiles = {}
     markers = {}
+    hlines = {}
 
-    # Load tiles and detect markers
-    for zone, path in tile_paths.items():
-        rot = rotations.get(zone, {}) if rotations else {}
-        tiles[zone] = load_tile(path, rot.get("deg"), rot.get("k"))
-        markers[zone] = detect_plus_markers(tiles[zone])
+    for z, path in tile_paths.items():
+        tiles[z] = load_tile(path, rotations.get(z) if rotations else None)
+        markers[z] = detect_plus_markers(tiles[z])
+        hlines[z] = detect_horizontal_dark_lines(tiles[z])
 
-        if len(markers[zone]) < 2:
-            raise RuntimeError(f"Zone {zone}: insufficient markers detected")
+        if len(markers[z]) < 1:
+            raise RuntimeError(f"Zone {z}: no '+' markers detected")
+        if len(hlines[z]) < 1:
+            raise RuntimeError(f"Zone {z}: no horizontal lines detected")
 
-    # Base canvas size
     h, w = tiles[1].shape
     canvas = np.zeros((h * 3, w * 2), dtype=np.uint8)
 
-    # Reference transform (zone 1 placed in center-top)
-    transforms = {
-        1: np.array([[1, 0, w // 2],
-                     [0, 1, h // 2]], dtype=np.float32)
-    }
+    # Placement dictionary
+    offsets = {}
 
-    # Order based on diagram adjacency
-    order = [2, 3, 4, 5, 6]
+    # ---- Reference tile (zone 1)
+    offsets[1] = (w // 2, h // 2)
 
-    for z in order:
-        for ref in transforms:
-            if len(markers[z]) == len(markers[ref]):
-                M = estimate_rigid_transform(
-                    markers[z],
-                    markers[ref]
-                )
-                M[:, 2] += transforms[ref][:, 2]
-                transforms[z] = M
-                break
+    # ---- Horizontal neighbors (X alignment via markers)
+    def align_x(left, right):
+        lx = np.mean([m[0] for m in markers[left]])
+        rx = np.mean([m[0] for m in markers[right]])
+        return int(lx - rx)
 
-        if z not in transforms:
-            raise RuntimeError(f"Could not align zone {z}")
+    # ---- Vertical neighbors (Y alignment via dark lines)
+    def align_y(top, bottom):
+        ty = np.median(hlines[top])
+        by = np.median(hlines[bottom])
+        return int(ty - by)
 
-    # Warp tiles into canvas
+    # zone 2 (right of 1)
+    dx = align_x(1, 2)
+    offsets[2] = (offsets[1][0] + w + dx, offsets[1][1])
+
+    # zone 3 (below 1)
+    dy = align_y(1, 3)
+    offsets[3] = (offsets[1][0], offsets[1][1] + h + dy)
+
+    # zone 4 (right of 3)
+    dx = align_x(3, 4)
+    offsets[4] = (offsets[3][0] + w + dx, offsets[3][1])
+
+    # zone 5 (below 3)
+    dy = align_y(3, 5)
+    offsets[5] = (offsets[3][0], offsets[3][1] + h + dy)
+
+    # zone 6 (right of 5)
+    dx = align_x(5, 6)
+    offsets[6] = (offsets[5][0] + w + dx, offsets[5][1])
+
+    # ---- Paste tiles
     for z, img in tiles.items():
-        warped = cv2.warpAffine(
-            img,
-            transforms[z],
-            (canvas.shape[1], canvas.shape[0]),
-            flags=cv2.INTER_LINEAR
+        x, y = offsets[z]
+        canvas[y:y+h, x:x+w] = np.maximum(
+            canvas[y:y+h, x:x+w], img
         )
-        canvas = np.maximum(canvas, warped)
 
     return canvas
 
 
-# ------------------------------------------------------------
-# Example execution
-# ------------------------------------------------------------
+# ============================================================
+# Example run
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -209,13 +195,12 @@ if __name__ == "__main__":
         6: "zone6.png",
     }
 
-    # Optional rotations per tile
     rotations = {
-        # 3: {"k": 1},        # rotate 90°
-        # 6: {"deg": -1.0},   # small correction
+        # 3: {"k": 1},
+        # 6: {"deg": -0.8},
     }
 
     stitched = stitch_tiles(tile_paths, rotations)
+    cv2.imwrite("stitched_hybrid.png", stitched)
 
-    cv2.imwrite("stitched_result.png", stitched)
-    print("Stitching completed -> stitched_result.png")
+    print("Hybrid stitching completed -> stitched_hybrid.png")
